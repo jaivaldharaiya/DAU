@@ -2,34 +2,27 @@ import sqlite3
 from flask import Flask, request, jsonify
 import os
 import base64
-import requests # No new libraries needed
+import requests
+import json
 
 # --- Configuration ---
 DATABASE_NAME = 'mydatabase.db'
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# This is the correct, working endpoint for the Gemini 2.5 Flash model.
-MODEL_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GOOGLE_API_KEY}"
+# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = 'AIzaSyCkytADPt1mTv7zVkWjVn9tSaOQHA0usOQ'
 
-# The keywords we want to detect in the image description
-HIGH_PRIORITY_KEYWORDS = ["cut tree", "stump", "trash", "garbage", "construction", "excavator", "smoke", "deforestation", "waste", "pollution"]
+# Gemini API endpoint
+MODEL_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GOOGLE_API_KEY}"
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
 
 # --- Database Setup ---
 def initialize_database():
-    """
-    This function connects to the database and creates the 'users' and 'images'
-    tables if they haven't been created yet. It's designed to be run
-    once when the server starts.
-    """
     connection = sqlite3.connect(DATABASE_NAME)
     cursor = connection.cursor()
     print("Database connected. Ensuring tables exist...")
 
-    # SQL command to create the 'users' table
-    # We've added a 'password' column that cannot be empty (NOT NULL).
-    create_user_table_query = """
+    cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         userid INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -39,91 +32,111 @@ def initialize_database():
         aadhar_verified INTEGER DEFAULT 0,
         credit_score INTEGER
     );
-    """
+    """)
 
-    # SQL command to create the 'images' table (unchanged)
-    create_image_table_query = """
+    cursor.execute("""
     CREATE TABLE IF NOT EXISTS images (
         image_id INTEGER PRIMARY KEY AUTOINCREMENT,
         geo_location TEXT,
-        image_url TEXT NOT NULL,
+        image_data BLOB,
         llm_classification TEXT,
+        description TEXT,
         is_useful INTEGER DEFAULT 0,
         captured_by_userid INTEGER,
         FOREIGN KEY (captured_by_userid) REFERENCES users (userid)
     );
-    """
-
-    # Run the SQL commands
-    cursor.execute(create_user_table_query)
-    cursor.execute(create_image_table_query)
+    """)
 
     print("Tables are ready.")
-
     connection.commit()
     connection.close()
 
-# --- API Routes ---
+import re
+import json
+ALLOWED_CLASSES = {"DEF", "POL", "ENC", "ECO", "OTH", "Not_relevant"}
 
-@app.route('/')
-def home():
-    return "Hello! The user database server is running."
+def _normalize_class(label: str) -> str:
+    """Map free-form labels to one of the allowed codes."""
+    if not label:
+        return "Not_relevant"
+    v = label.strip().upper().replace("-", "_")
+    # direct codes
+    if v in {"DEF", "POL", "ENC", "ECO", "OTH"}:
+        return v
+    if v in {"NOT_RELEVANT", "NOT_RELEVANT_", "NOT_RELEVANT__"}:
+        return "Not_relevant"
+    # common words → codes
+    if "DEFOR" in v or "BURN" in v or "LOG" in v:
+        return "DEF"
+    if "POLLUT" in v or "WASTE" in v or "SEWAGE" in v or "OIL" in v:
+        return "POL"
+    if "ENCROACH" in v or "CONSTRUCT" in v or "LANDFILL" in v or "AQUACULTURE" in v:
+        return "ENC"
+    if "ECO" in v or "STRESS" in v or "PEST" in v or "ALGA" in v or "DIE" in v:
+        return "ECO"
+    if "OTHER" in v or "UNSPECIFIED" in v or "POACH" in v or "FIRE" in v:
+        return "OTH"
+    return "Not_relevant"
 
-@app.route('/adduser', methods=['POST'])
-def add_new_user():
+def _parse_gemini_json_text(text: str) -> dict:
+    """Be tolerant to code fences / extra prose and pull out a JSON object."""
+    s = (text or "").strip()
 
-    data = request.get_json()
+    # strip code fences like ```json ... ``` or ``` ...
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
 
-    # Get the name, phone number, and new password field from the JSON data.
-    user_name = data.get('name')
-    phone_number = data.get('phone')
-    password = data.get('password')
-
-    # If any of the required fields are missing, send back an error message.
-    if not all([user_name, phone_number, password]):
-        return jsonify({'message': 'Error: Please provide name, phone number, and password.'}), 400
-
+    # 1) try whole string
     try:
-        connection = sqlite3.connect(DATABASE_NAME)
-        cursor = connection.cursor()
+        return json.loads(s)
+    except Exception:
+        pass
 
-        # The SQL query is updated to include the 'password' column.
-        insert_query = "INSERT INTO users (name, phone_number, password) VALUES (?, ?, ?)"
+    # 2) try the largest {...} block
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        candidate = m.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
-        # Execute the query, passing the user's data including the password.
-        cursor.execute(insert_query, (user_name, phone_number, password))
-
-        connection.commit()
-
-        return jsonify({'message': f"Success: User '{user_name}' was added to the database."}), 201
-
-    except sqlite3.IntegrityError:
-        return jsonify({'message': f"Error: A user with phone number '{phone_number}' already exists."}), 409
-    except Exception as e:
-        return jsonify({'message': 'An error occurred on the server.', 'error': str(e)}), 500
-    finally:
-        if 'connection' in locals() and connection:
-            connection.close()
-
-# --- Main Execution Block ---
-# --- ✨ NEW: Image Analysis Endpoint (Now using Gemini) ✨ ---
-
+    # 3) last-ditch: regex for the two fields
+    result = {}
+    m_cls = re.search(r'"?classification"?\s*:\s*"([^"]+)"', s, flags=re.IGNORECASE)
+    if m_cls:
+        result["classification"] = m_cls.group(1)
+    m_reason = re.search(r'"?reasoning"?\s*:\s*"(.*?)"', s, flags=re.IGNORECASE | re.DOTALL)
+    if m_reason:
+        # squash excessive whitespace/newlines
+        result["reasoning"] = re.sub(r"\s+", " ", m_reason.group(1)).strip()
+    return result
+# --- Gemini API helper ---
 def analyze_image_with_gemini(image_base64):
     """
-    Sends the image to the Google Gemini Vision API and returns the description.
+    Sends the image to the Google Gemini Vision API and returns a dict:
+      { "classification": <DEF|POL|ENC|ECO|OTH|Not_relevant>, "reasoning": <str> }
     """
     if not GOOGLE_API_KEY:
-        return "Error: GOOGLE_API_KEY environment variable not set."
+        return {"error": "GOOGLE_API_KEY environment variable not set."}
 
     headers = {"Content-Type": "application/json"}
 
     prompt_text = (
-        "Analyze this image for environmental concerns. "
-        "Describe what you see in one short sentence. "
-        "Focus on any signs of tree cutting, trash, construction, or smoke."
+        "You are an environmental monitoring assistant. "
+        "Analyze this image and classify it into exactly one of the following categories:\n\n"
+        "- DEF (Deforestation): Cutting, clearing, or burning of mangrove trees.\n"
+        "- POL (Pollution): Dumping or release of harmful substances (solid waste, oil spill, sewage, etc.).\n"
+        "- ENC (Encroachment): Illegal construction, land reclamation, aquaculture pond conversion.\n"
+        "- ECO (Ecological Stress): Natural or human-induced threats (pest infestation, algal blooms, mass die-off).\n"
+        "- OTH (Other): Poaching, illegal fishing, fire, or unspecified disturbance.\n"
+        "- Not_relevant: If the image does not relate to mangrove environmental concerns.\n\n"
+        "Return only a JSON object with exactly these two fields:\n"
+        '{\"classification\": \"DEF|POL|ENC|ECO|OTH|Not_relevant\", \"reasoning\": \"<short explanation>\"}\n'
+        "Do not include any extra text or markdown."
     )
 
-    # This is the specific JSON payload structure required by the Gemini API for multimodal input.
     payload = {
         "contents": [{
             "parts": [
@@ -139,143 +152,216 @@ def analyze_image_with_gemini(image_base64):
     }
 
     try:
-        response = requests.post(MODEL_ENDPOINT, headers=headers, json=payload)
-        response.raise_for_status() # Raise an error for bad status codes
-        
-        # Parse the response to get the generated text.
-        # This navigates the Gemini API's JSON response structure.
-        result = response.json()
-        description = result['candidates'][0]['content']['parts'][0]['text']
-        return description
-    except requests.exceptions.RequestException as e:
-        print(f"API request failed: {e}")
-        # Return the error message from the API if available
-        error_response = response.json() if response else {}
-        error_message = error_response.get("error", {}).get("message", str(e))
-        return f"Error: Failed to communicate with the vision API. Details: {error_message}"
+        resp = requests.post(MODEL_ENDPOINT, headers=headers, json=payload)
+        resp.raise_for_status()
+        body = resp.json()
 
+        # get model text
+        model_text = body["candidates"][0]["content"]["parts"][0]["text"]
+
+        # robust parse
+        parsed = _parse_gemini_json_text(model_text)
+
+        # normalize + validate
+        classification_raw = parsed.get("classification", "")
+        classification = _normalize_class(classification_raw)
+        reasoning = parsed.get("reasoning", "").strip() or "No reasoning provided."
+
+        return {"classification": classification, "reasoning": reasoning}
+
+    except requests.exceptions.RequestException as e:
+        error_response = resp.json() if 'resp' in locals() and resp is not None else {}
+        error_message = error_response.get("error", {}).get("message", str(e))
+        return {"error": f"Failed to communicate with the vision API. Details: {error_message}"}
+    except Exception as e:
+        return {"error": f"Unexpected parsing error: {str(e)}"}
+    
+# --- API Routes ---
+@app.route('/')
+def home():
+    return "Hello! The user database server is running."
+
+@app.route('/adduser', methods=['POST'])
+def add_new_user():
+    data = request.get_json()
+    user_name = data.get('name')
+    phone_number = data.get('phone')
+    password = data.get('password')
+
+    if not all([user_name, phone_number, password]):
+        return jsonify({'message': 'Error: Please provide name, phone number, and password.'}), 400
+
+    try:
+        connection = sqlite3.connect(DATABASE_NAME)
+        cursor = connection.cursor()
+        cursor.execute("INSERT INTO users (name, phone_number, password) VALUES (?, ?, ?)",
+                       (user_name, phone_number, password))
+        connection.commit()
+        return jsonify({'message': f"Success: User '{user_name}' was added to the database."}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({'message': f"Error: A user with phone number '{phone_number}' already exists."}), 409
+    except Exception as e:
+        return jsonify({'message': 'An error occurred on the server.', 'error': str(e)}), 500
+    finally:
+        if 'connection' in locals():
+            connection.close()
+
+@app.route('/login', methods=['POST'])
+def login_user():
+    data = request.get_json()
+    phone_number = data.get('phone')
+    password = data.get('password')
+
+    if not phone_number or not password:
+        return jsonify({'message': 'Error: Please provide both phone number and password.'}), 400
+
+    try:
+        connection = sqlite3.connect(DATABASE_NAME)
+        cursor = connection.cursor()
+        cursor.execute("SELECT userid, password FROM users WHERE phone_number = ?", (phone_number,))
+        user_record = cursor.fetchone()
+        if user_record is None:
+            return jsonify({'message': 'Login failed: User not found.'}), 401
+        stored_password = user_record[1]
+        if password == stored_password:
+            return jsonify({'message': 'Login successful!', 'userid': user_record[0]}), 200
+        else:
+            return jsonify({'message': 'Login failed: Incorrect password.'}), 401
+    except Exception as e:
+        return jsonify({'message': 'An error occurred on the server.', 'error': str(e)}), 500
+    finally:
+        if 'connection' in locals():
+            connection.close()
 
 @app.route('/upload_image', methods=['POST'])
 def upload_image():
-    """
-    Receives an image, user_id, and geo_location from Flutter.
-    Analyzes the image with Gemini and saves the results.
-    """
-    # 1. Check for required data (this part is unchanged)
     if 'image' not in request.files:
         return jsonify({"message": "Error: No image file provided."}), 400
+
     user_id = request.form.get('user_id')
     geo_location = request.form.get('geo_location')
     if not user_id or not geo_location:
         return jsonify({"message": "Error: user_id and geo_location are required."}), 400
 
     image_file = request.files['image']
-
-    # 2. Process image (this part is unchanged)
     image_bytes = image_file.read()
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
 
-    # 3. Call the Vision LLM (now Gemini)
-    description = analyze_image_with_gemini(image_base64)
+    # --- For Debugging: See what the API is returning ---
+    # print("Sending image to Gemini for analysis...")
+    analysis_result = analyze_image_with_gemini(image_base64)
+    
+    # --- Recommended: Print the raw and parsed results to your console ---
+    # --- This helps verify if the LLM response is what you expect.   ---
+    # print(f"GEMINI RAW RESPONSE: {analysis_result}")
+    
+    if "error" in analysis_result:
+        return jsonify(analysis_result), 500
 
-    # 4. Analyze the response (this part is unchanged)
-    is_high_priority = any(keyword in description.lower() for keyword in HIGH_PRIORITY_KEYWORDS)
+    classification = analysis_result.get('classification')
+    reasoning = analysis_result.get('reasoning', 'No reasoning provided.')
 
-    # 5. Save to database (this part is unchanged)
-    image_url_placeholder = f"user_{user_id}_image_{image_file.filename}"
+    # --- KEY LOGIC CHANGE ---
+    # If the image is classified as 'Not_relevant' by the LLM, we can ignore it
+    # or handle it separately. For this example, we'll just stop processing.
+    if classification == 'Not_relevant':
+        return jsonify({
+            "message": "Image analyzed as not relevant and was not stored.",
+            "classification": classification,
+            "reasoning": reasoning
+        }), 200 # 200 OK is appropriate here, it's not a server error.
+
+    # All other valid classifications (DEF, POL, etc.) are considered "pending cases".
+    # Therefore, we will store them with is_useful = 0.
+    # An admin will later approve them via the /approve_case/<id> endpoint, changing it to 1.
+    is_useful_status = 0 
+
     try:
         connection = sqlite3.connect(DATABASE_NAME)
         cursor = connection.cursor()
-        insert_query = """
-        INSERT INTO images (geo_location, image_url, llm_classification, is_useful, captured_by_userid)
-        VALUES (?, ?, ?, ?, ?)
-        """
-        cursor.execute(insert_query, (geo_location, image_url_placeholder, description, int(is_high_priority), user_id))
+        cursor.execute("""
+            INSERT INTO images (geo_location, image_data, llm_classification, description, is_useful, captured_by_userid)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            geo_location,
+            sqlite3.Binary(image_bytes),
+            classification,  # This correctly maps to the 'llm_classification' column
+            reasoning,       # This correctly maps to the 'description' column
+            is_useful_status,# This is now correctly set to 0 for pending review
+            user_id
+        ))
         connection.commit()
+        image_id = cursor.lastrowid # Get the ID of the newly inserted image
     except Exception as e:
         return jsonify({"message": "Database error.", "error": str(e)}), 500
     finally:
         if 'connection' in locals():
             connection.close()
 
-    # 6. Send response back to Flutter
     return jsonify({
-        "message": "Image uploaded and analyzed successfully!",
-        "description": description,
-        "is_high_priority": is_high_priority
+        "message": "Image classified and stored successfully as a pending case!",
+        "image_id": image_id,
+        "classification": classification,
+        "reasoning": reasoning
     }), 201
-@app.route('/login', methods=['POST'])
-def login_user():
-    """
-    Handles user login by verifying phone number and password.
-    Expects a JSON message like: {"phone": "1234567890", "password": "securepassword123"}
-    """
-    data = request.get_json()
 
-    # 1. Get phone and password from the request
-    phone_number = data.get('phone')
-    password = data.get('password')
-
-    # 2. Check if both fields were provided
-    if not phone_number or not password:
-        return jsonify({'message': 'Error: Please provide both phone number and password.'}), 400
-
+@app.route('/cases/<int:status>', methods=['GET'])
+def get_cases_api(status):
+    """API to get cases. status=0 for pending, status=1 for approved."""
     try:
-        # 3. Connect to the database
-        connection = sqlite3.connect(DATABASE_NAME)
-        cursor = connection.cursor()
+        conn = sqlite3.connect(DATABASE_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM images WHERE is_useful = ?", (status,))
+        rows = cursor.fetchall()
 
-        # 4. Find the user by their unique phone number
-        # We select the user's ID and their stored password
-        query = "SELECT userid, password FROM users WHERE phone_number = ?"
-        cursor.execute(query, (phone_number,))
-        user_record = cursor.fetchone() # Fetches the first matching user
+        cases = []
+        for row in rows:
+            case = dict(row)
+            if "image_data" in case and case["image_data"]:
+                try:
+                    case["image_data"] = base64.b64encode(case["image_data"]).decode("utf-8")
+                except Exception:
+                    case["image_data"] = None
+            cases.append(case)
 
-        # 5. Verify the user and password
-        if user_record is None:
-            # Case 1: No user found with that phone number
-            return jsonify({'message': 'Login failed: User not found.'}), 401
-        
-        stored_password = user_record[1]
-        if password == stored_password:
-            # Case 2: Success! Passwords match.
-            user_id = user_record[0]
-            return jsonify({
-                'message': 'Login successful!',
-                'userid': user_id
-            }), 200
-        else:
-            # Case 3: User found, but password was incorrect
-            return jsonify({'message': 'Login failed: Incorrect password.'}), 401
-
+        return jsonify(cases), 200
     except Exception as e:
-        # Handle any server-side errors
-        return jsonify({'message': 'An error occurred on the server.', 'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
     finally:
-        # 6. Always close the connection
-        if 'connection' in locals() and connection:
-            connection.close()
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/approve_case/<int:image_id>', methods=['POST'])
+def approve_case_api(image_id):
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE images SET is_useful = 1 WHERE image_id = ?", (image_id,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({'message': f'Error: Case with ID {image_id} not found.'}), 404
+        return jsonify({'message': f'Success: Case #{image_id} approved.'}), 200
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/reject_case/<int:image_id>', methods=['DELETE'])
+def reject_case_api(image_id):
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM images WHERE image_id = ?", (image_id,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({'message': f'Error: Case with ID {image_id} not found.'}), 404
+        return jsonify({'message': f'Success: Case #{image_id} rejected and deleted.'}), 200
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 # --- Main Execution Block ---
-
 if __name__ == '__main__':
     initialize_database()
-    port = int(os.environ.get("PORT", 5000))  # use host-provided port, default 5000
+    port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
-# ### Your Action Plan for the Hackathon:
-
-# 1.  **Get a Google API Key (2 minutes):**
-#     * Go to **[Google AI Studio](https://aistudio.google.com/app/apikey)**.
-#     * Click "**Create API key**".
-#     * Copy the key immediately and save it somewhere safe.
-
-# 2.  **Update `requirements.txt` (30 seconds):**
-#     Make sure your `requirements.txt` file for Render has these lines:
-#     ```text
-#     Flask
-#     requests
-#     gunicorn
-    
-
-
-
