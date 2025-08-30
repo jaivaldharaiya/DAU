@@ -257,13 +257,11 @@ def login_user():
             connection.close()
 
 # --- Main Execution Block ---
+
 if __name__ == '__main__':
     initialize_database()
-    # For Render, the port is often set automatically, but 5000 is a good default for local testing.
-    # debug=False is better for production, but True is fine for the hackathon.
-    app.run(host='0.0.0.0', port=5001, debug=True)
-
-
+    port = int(os.environ.get("PORT", 5000))  # use host-provided port, default 5000
+    app.run(host='0.0.0.0', port=port, debug=False)
 # ### Your Action Plan for the Hackathon:
 
 # 1.  **Get a Google API Key (2 minutes):**
