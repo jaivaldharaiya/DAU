@@ -6,7 +6,7 @@ from io import BytesIO
 from PIL import Image
 
 # --- Configuration ---
-FLASK_BASE_URL = "http://127.0.0.1:5001"
+FLASK_BASE_URL = "https://dau-o5gq.onrender.com"
 CLASSIFICATION_INFO = {
     "DEF": {"name": "Deforestation", "icon": "🌳"},
     "POL": {"name": "Pollution", "icon": "🗑️"},
@@ -96,13 +96,47 @@ def main_dashboard():
     st.title("Mangrove Environmental Monitoring Dashboard")
     pending_tab, approved_tab = st.tabs(["🚨 Pending Review", "✅ Approved Cases"])
 
-    with pending_tab:
-        st.subheader("New Reports Awaiting Approval")
-        pending_cases = get_cases(status=0)
-        if pending_cases.empty:
-            st.success("All clear! No pending cases.")
+    # --- Helper function for filtering and displaying cases ---
+    def display_filtered_cases(tab_title, cases_df, show_actions=False):
+        st.subheader(tab_title)
+
+        if cases_df.empty:
+            st.success("All clear! No cases to display.")
+            return
+
+        # --- NEW: Filter Controls ---
+        filter_col1, filter_col2 = st.columns([1, 2])
+        
+        # Create a list of classification options for the filter
+        class_options = ["All"] + [f"{info['icon']} {info['name']}" for info in CLASSIFICATION_INFO.values()]
+        
+        with filter_col1:
+            selected_class_name = st.selectbox("Filter by Type", options=class_options, key=f"filter_{tab_title}")
+        
+        with filter_col2:
+            search_query = st.text_input("Search by AI Reasoning", placeholder="e.g., oil spill, tree cutting...", key=f"search_{tab_title}").lower()
+
+        # --- Filter Logic ---
+        filtered_cases = cases_df.copy()
+
+        # 1. Filter by selected classification
+        if selected_class_name != "All":
+            # Find the code (e.g., 'DEF') corresponding to the selected name ('🌳 Deforestation')
+            selected_code = next((code for code, info in CLASSIFICATION_INFO.items() if f"{info['icon']} {info['name']}" == selected_class_name), None)
+            if selected_code:
+                filtered_cases = filtered_cases[filtered_cases['llm_classification'] == selected_code]
+
+        # 2. Filter by search query in the description
+        if search_query:
+            # Ensure the 'description' column exists and is of string type before searching
+            if 'description' in filtered_cases.columns:
+                 filtered_cases = filtered_cases[filtered_cases['description'].str.lower().str.contains(search_query, na=False)]
+
+        # --- Display Cases ---
+        if filtered_cases.empty:
+            st.warning("No cases match the current filter criteria.")
         else:
-            for _, case in pending_cases.iterrows():
+            for _, case in filtered_cases.iterrows():
                 with st.container(border=True):
                     col1, col2 = st.columns([1, 2])
                     with col1:
@@ -113,29 +147,27 @@ def main_dashboard():
                         st.markdown(f"**Location:** `{case['geo_location']}`")
                         st.markdown(f"**Classification Code:** `{case['llm_classification']}`")
                         
-                        b_col1, b_col2 = st.columns(2)
-                        b_col1.button("Approve", key=f"approve_{case['image_id']}", 
-                                      on_click=approve_case, args=(case['image_id'],), type="primary", use_container_width=True)
-                        b_col2.button("Reject", key=f"reject_{case['image_id']}", 
-                                      on_click=reject_case, args=(case['image_id'],), use_container_width=True)
+                        # --- NEW: Displaying AI Description ---
+                        if 'description' in case and pd.notna(case['description']):
+                            st.info(f"**AI Reasoning:** {case['description']}")
+
+                        # Show approve/reject buttons only in the pending tab
+                        if show_actions:
+                            b_col1, b_col2 = st.columns(2)
+                            b_col1.button("Approve", key=f"approve_{case['image_id']}", 
+                                          on_click=approve_case, args=(case['image_id'],), type="primary", use_container_width=True)
+                            b_col2.button("Reject", key=f"reject_{case['image_id']}", 
+                                          on_click=reject_case, args=(case['image_id'],), use_container_width=True)
+    
+    # --- Tab Implementations ---
+    with pending_tab:
+        pending_cases = get_cases(status=0)
+        display_filtered_cases("New Reports Awaiting Approval", pending_cases, show_actions=True)
 
     with approved_tab:
-        st.subheader("Approved Reports")
         approved_cases = get_cases(status=1)
-        if approved_cases.empty:
-            st.info("No cases have been approved yet.")
-        else:
-            for _, case in approved_cases.iterrows():
-                with st.container(border=True):
-                    col1, col2 = st.columns([1, 2])
-                    with col1:
-                        display_case_image(case, caption=f"Case ID: {case['image_id']}")
-                    with col2:
-                        info = CLASSIFICATION_INFO.get(case['llm_classification'], {})
-                        st.subheader(f"{info.get('icon', '❓')} {info.get('name', 'Unknown')} Report")
-                        st.markdown(f"**Location:** `{case['geo_location']}`")
-                        st.markdown(f"**Classification Code:** `{case['llm_classification']}`")
-
+        display_filtered_cases("Approved Reports", approved_cases, show_actions=False)
+        
 # --- Authentication Check ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False

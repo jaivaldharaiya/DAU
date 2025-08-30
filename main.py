@@ -388,6 +388,32 @@ def reject_case_api(image_id):
         if 'conn' in locals():
             conn.close()
 
+@app.route('/users', methods=['GET'])
+def get_all_users():
+    """API to fetch all users with their ID, name, and credit score."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        conn.row_factory = sqlite3.Row # This allows accessing columns by name
+        cursor = conn.cursor()
+        
+        # The COALESCE function ensures that if credit_score is NULL, it will be returned as 0.
+        cursor.execute("SELECT userid, name, COALESCE(credit_score, 0) as credit_score FROM users ORDER BY credit_score DESC")
+        
+        rows = cursor.fetchall()
+
+        # Convert the list of database row objects into a list of simple dictionaries
+        users_list = [dict(row) for row in rows]
+
+        return jsonify(users_list), 200
+
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch users.", "details": str(e)}), 500
+        
+    finally:
+        if conn:
+            conn.close()
+
 # --- Main Execution Block ---
 if __name__ == '__main__':
     initialize_database()
