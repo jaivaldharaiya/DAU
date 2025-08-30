@@ -204,7 +204,57 @@ def upload_image():
         "description": description,
         "is_high_priority": is_high_priority
     }), 201
+@app.route('/login', methods=['POST'])
+def login_user():
+    """
+    Handles user login by verifying phone number and password.
+    Expects a JSON message like: {"phone": "1234567890", "password": "securepassword123"}
+    """
+    data = request.get_json()
 
+    # 1. Get phone and password from the request
+    phone_number = data.get('phone')
+    password = data.get('password')
+
+    # 2. Check if both fields were provided
+    if not phone_number or not password:
+        return jsonify({'message': 'Error: Please provide both phone number and password.'}), 400
+
+    try:
+        # 3. Connect to the database
+        connection = sqlite3.connect(DATABASE_NAME)
+        cursor = connection.cursor()
+
+        # 4. Find the user by their unique phone number
+        # We select the user's ID and their stored password
+        query = "SELECT userid, password FROM users WHERE phone_number = ?"
+        cursor.execute(query, (phone_number,))
+        user_record = cursor.fetchone() # Fetches the first matching user
+
+        # 5. Verify the user and password
+        if user_record is None:
+            # Case 1: No user found with that phone number
+            return jsonify({'message': 'Login failed: User not found.'}), 401
+        
+        stored_password = user_record[1]
+        if password == stored_password:
+            # Case 2: Success! Passwords match.
+            user_id = user_record[0]
+            return jsonify({
+                'message': 'Login successful!',
+                'userid': user_id
+            }), 200
+        else:
+            # Case 3: User found, but password was incorrect
+            return jsonify({'message': 'Login failed: Incorrect password.'}), 401
+
+    except Exception as e:
+        # Handle any server-side errors
+        return jsonify({'message': 'An error occurred on the server.', 'error': str(e)}), 500
+    finally:
+        # 6. Always close the connection
+        if 'connection' in locals() and connection:
+            connection.close()
 
 # --- Main Execution Block ---
 if __name__ == '__main__':
