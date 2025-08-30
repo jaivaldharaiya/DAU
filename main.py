@@ -334,16 +334,44 @@ def get_cases_api(status):
 
 @app.route('/approve_case/<int:image_id>', methods=['POST'])
 def approve_case_api(image_id):
+    conn = None # Define connection variable to ensure it's accessible in finally block
     try:
         conn = sqlite3.connect(DATABASE_NAME)
         cursor = conn.cursor()
-        cursor.execute("UPDATE images SET is_useful = 1 WHERE image_id = ?", (image_id,))
-        conn.commit()
-        if cursor.rowcount == 0:
+
+        # --- NEW LOGIC: Find the user who submitted the case ---
+        # We need to get the user's ID before we can award a credit.
+        cursor.execute("SELECT captured_by_userid FROM images WHERE image_id = ?", (image_id,))
+        result = cursor.fetchone()
+
+        # If the image ID doesn't exist, we can't proceed.
+        if result is None:
             return jsonify({'message': f'Error: Case with ID {image_id} not found.'}), 404
-        return jsonify({'message': f'Success: Case #{image_id} approved.'}), 200
+        
+        user_id_to_credit = result[0]
+
+        # --- Original Logic: Approve the case ---
+        cursor.execute("UPDATE images SET is_useful = 1 WHERE image_id = ?", (image_id,))
+        
+        # --- NEW LOGIC: Award one credit point to the user ---
+        # The COALESCE function safely handles cases where credit_score is NULL by treating it as 0.
+        cursor.execute("""
+            UPDATE users 
+            SET credit_score = COALESCE(credit_score, 0) + 1 
+            WHERE userid = ?
+        """, (user_id_to_credit,))
+
+        # Commit both the case approval and the credit score update in a single transaction
+        conn.commit()
+        
+        return jsonify({'message': f'Success: Case #{image_id} approved and 1 credit awarded to user #{user_id_to_credit}.'}), 200
+
+    except Exception as e:
+        # It's good practice to have error handling for the database operations
+        return jsonify({'message': 'An error occurred on the server.', 'error': str(e)}), 500
+
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
 
 @app.route('/reject_case/<int:image_id>', methods=['DELETE'])
